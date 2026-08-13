@@ -5,14 +5,16 @@ user run each one against superstore.db. The SQL is shown alongside every
 result: the queries are the point of this project, not the charts.
 """
 
+import pathlib
 import re
 import sqlite3
 
 import pandas as pd
 import streamlit as st
 
-DB_PATH = "superstore.db"
-SQL_PATH = "queries/analysis.sql"
+ROOT = pathlib.Path(__file__).parent
+DB_PATH = ROOT / "superstore.db"
+SQL_PATH = ROOT / "analysis.sql"
 
 st.set_page_config(page_title="Superstore SQL Analysis", layout="wide")
 
@@ -21,31 +23,33 @@ st.set_page_config(page_title="Superstore SQL Analysis", layout="wide")
 def get_connection():
     # check_same_thread=False: Streamlit reruns the script on a different
     # thread than the one that opened the connection.
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    return sqlite3.connect(str(DB_PATH), check_same_thread=False)
 
 
 @st.cache_data
 def load_queries():
-    """Split analysis.sql into {title: sql} using the '-- Qn.' comment headers."""
-    text = open(SQL_PATH).read()
-    blocks = re.split(r"^-- Q(\d+)\.\s*", text, flags=re.MULTILINE)[1:]
+    """Split analysis.sql into {title: sql} using the '-- Qn. <title>' headers."""
+    text = SQL_PATH.read_text()
 
+    # Find each header line and where it starts.
+    headers = list(re.finditer(r"^--\s*Q(\d+)\.\s*(.+)$", text, re.MULTILINE))
     queries = {}
-    for num, body in zip(blocks[::2], blocks[1::2]):
-        lines = body.splitlines()
-        # Title = comment lines before the first line of actual SQL.
-        title_lines = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("--") and "---" not in stripped:
-                title_lines.append(stripped.lstrip("- ").strip())
-            elif stripped and not stripped.startswith("--"):
-                break
-        title = title_lines[0] if title_lines else f"Query {num}"
-        sql = "\n".join(l for l in lines if not l.strip().startswith("--")).strip()
-        sql = sql.rstrip(";")
+
+    for idx, match in enumerate(headers):
+        num, title = match.group(1), match.group(2).strip()
+        body_start = match.end()
+        body_end = headers[idx + 1].start() if idx + 1 < len(headers) else len(text)
+        body = text[body_start:body_end]
+
+        # Drop every remaining comment line; keep the SQL.
+        sql = "\n".join(
+            line for line in body.splitlines()
+            if line.strip() and not line.strip().startswith("--")
+        ).strip().rstrip(";")
+
         if sql:
             queries[f"Q{num}. {title}"] = sql
+
     return queries
 
 
@@ -56,7 +60,7 @@ def run(sql):
 
 st.title("Superstore Sales Analysis")
 st.caption(
-    "~10,000 retail order line-items across three related tables. "
+    "9,994 order line-items, normalised into four related tables. "
     "Each question below is answered by a single SQL query."
 )
 

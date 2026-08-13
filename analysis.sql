@@ -1,39 +1,37 @@
 -- ============================================================
 -- Superstore SQL Analysis
--- Each query answers one business question.
--- Run against the SQLite database built by schema/01_schema.sql
+-- Source: one flat 9,994-row CSV, normalised into
+--   customers / products / orders / order_items
+-- Every query below needs a join because of that split.
 -- ============================================================
 
 
--- ------------------------------------------------------------
--- Q1. Which categories drive revenue, and which drive profit?
---     (These are not the same list — that is the finding.)
--- Technique: GROUP BY, aggregate arithmetic, HAVING
--- ------------------------------------------------------------
+-- Q1. Which sub-categories make money, and which lose it?
+-- Technique: join, GROUP BY, aggregate arithmetic
 SELECT
-    category,
-    sub_category,
-    ROUND(SUM(sales), 2)                          AS revenue,
-    ROUND(SUM(profit), 2)                         AS profit,
-    ROUND(100.0 * SUM(profit) / SUM(sales), 1)    AS margin_pct,
-    COUNT(DISTINCT order_id)                      AS orders
-FROM orders
-GROUP BY category, sub_category
-ORDER BY profit ASC;          -- loss-makers first
+    p.category,
+    p.sub_category,
+    ROUND(SUM(i.sales), 2)                       AS revenue,
+    ROUND(SUM(i.profit), 2)                      AS profit,
+    ROUND(100.0 * SUM(i.profit) / SUM(i.sales), 1) AS margin_pct
+FROM order_items i
+JOIN products p ON i.product_id = p.product_id
+GROUP BY p.category, p.sub_category
+ORDER BY profit ASC;
 
 
--- ------------------------------------------------------------
 -- Q2. Top 3 sub-categories by revenue within each region.
--- Technique: window function (RANK) inside a CTE
--- ------------------------------------------------------------
+-- Technique: three-table join, RANK() window function inside a CTE
 WITH regional AS (
     SELECT
-        region,
-        sub_category,
-        SUM(sales) AS revenue,
-        RANK() OVER (PARTITION BY region ORDER BY SUM(sales) DESC) AS rnk
-    FROM orders
-    GROUP BY region, sub_category
+        o.region,
+        p.sub_category,
+        SUM(i.sales) AS revenue,
+        RANK() OVER (PARTITION BY o.region ORDER BY SUM(i.sales) DESC) AS rnk
+    FROM order_items i
+    JOIN orders   o ON i.order_id   = o.order_id
+    JOIN products p ON i.product_id = p.product_id
+    GROUP BY o.region, p.sub_category
 )
 SELECT region, sub_category, ROUND(revenue, 2) AS revenue, rnk
 FROM regional
@@ -41,127 +39,113 @@ WHERE rnk <= 3
 ORDER BY region, rnk;
 
 
--- ------------------------------------------------------------
 -- Q3. Month-over-month revenue growth.
--- Technique: date truncation, LAG window function
--- ------------------------------------------------------------
+-- Technique: date truncation, LAG() to reach the previous row
 WITH monthly AS (
-    SELECT
-        STRFTIME('%Y-%m', order_date) AS month,
-        SUM(sales)                    AS revenue
-    FROM orders
+    SELECT STRFTIME('%Y-%m', o.order_date) AS month,
+           SUM(i.sales)                    AS revenue
+    FROM order_items i
+    JOIN orders o ON i.order_id = o.order_id
     GROUP BY month
 )
 SELECT
     month,
-    ROUND(revenue, 2)                                   AS revenue,
-    ROUND(LAG(revenue) OVER (ORDER BY month), 2)        AS prev_month,
+    ROUND(revenue, 2)                            AS revenue,
+    ROUND(LAG(revenue) OVER (ORDER BY month), 2) AS prev_month,
     ROUND(100.0 * (revenue - LAG(revenue) OVER (ORDER BY month))
-          / LAG(revenue) OVER (ORDER BY month), 1)      AS growth_pct
+          / LAG(revenue) OVER (ORDER BY month), 1) AS growth_pct
 FROM monthly
 ORDER BY month;
 
 
--- ------------------------------------------------------------
--- Q4. Return rate by category — do returns concentrate anywhere?
--- Technique: LEFT JOIN + conditional aggregation
---     LEFT JOIN matters: an INNER JOIN would silently drop every
---     order that was never returned and give a 100% return rate.
--- ------------------------------------------------------------
+-- Q4. Does discounting buy volume, or just erode margin?
+-- Technique: CASE binning, GROUP BY a derived column
 SELECT
-    o.category,
-    COUNT(DISTINCT o.order_id)                                     AS total_orders,
-    COUNT(DISTINCT CASE WHEN r.returned IS NOT NULL
-                        THEN o.order_id END)                       AS returned_orders,
-    ROUND(100.0 * COUNT(DISTINCT CASE WHEN r.returned IS NOT NULL
-                                      THEN o.order_id END)
-          / COUNT(DISTINCT o.order_id), 2)                         AS return_rate_pct
-FROM orders o
-LEFT JOIN returns r ON o.order_id = r.order_id
-GROUP BY o.category
-ORDER BY return_rate_pct DESC;
-
-
--- ------------------------------------------------------------
--- Q5. Does discounting actually buy volume, or just erode margin?
--- Technique: CASE binning, GROUP BY on a derived column
--- ------------------------------------------------------------
-SELECT
-    CASE
-        WHEN discount = 0              THEN '0%'
-        WHEN discount <= 0.20          THEN '1-20%'
-        WHEN discount <= 0.40          THEN '21-40%'
-        ELSE                                '40%+'
-    END                                        AS discount_band,
-    COUNT(*)                                   AS line_items,
-    ROUND(SUM(sales), 2)                       AS revenue,
-    ROUND(SUM(profit), 2)                      AS profit,
-    ROUND(100.0 * SUM(profit) / SUM(sales), 1) AS margin_pct,
-    ROUND(AVG(quantity), 2)                    AS avg_qty
-FROM orders
+    CASE WHEN discount = 0     THEN '0%'
+         WHEN discount <= 0.20 THEN '1-20%'
+         WHEN discount <= 0.40 THEN '21-40%'
+         ELSE                       '40%+' END   AS discount_band,
+    COUNT(*)                                     AS line_items,
+    ROUND(SUM(sales), 2)                         AS revenue,
+    ROUND(SUM(profit), 2)                        AS profit,
+    ROUND(100.0 * SUM(profit) / SUM(sales), 1)   AS margin_pct,
+    ROUND(AVG(quantity), 2)                      AS avg_qty
+FROM order_items
 GROUP BY discount_band
 ORDER BY MIN(discount);
 
 
--- ------------------------------------------------------------
--- Q6. Customer value: who are the top 10, and what share of
---     revenue do they represent?
--- Technique: CTE, window aggregate over the whole result set
--- ------------------------------------------------------------
-WITH customer_totals AS (
-    SELECT
-        customer_id,
-        customer_name,
-        segment,
-        SUM(sales)               AS revenue,
-        COUNT(DISTINCT order_id) AS orders
-    FROM orders
-    GROUP BY customer_id, customer_name, segment
+-- Q5. Top 10 customers, and what share of revenue they hold.
+-- Technique: CTE, window aggregate SUM() OVER () across all rows
+WITH totals AS (
+    SELECT c.customer_id, c.customer_name, c.segment,
+           SUM(i.sales)               AS revenue,
+           COUNT(DISTINCT o.order_id) AS orders
+    FROM order_items i
+    JOIN orders    o ON i.order_id    = o.order_id
+    JOIN customers c ON o.customer_id = c.customer_id
+    GROUP BY c.customer_id, c.customer_name, c.segment
 )
 SELECT
     customer_name,
     segment,
-    ROUND(revenue, 2)                                        AS revenue,
+    ROUND(revenue, 2)                                 AS revenue,
     orders,
-    ROUND(revenue / orders, 2)                               AS avg_order_value,
-    ROUND(100.0 * revenue / SUM(revenue) OVER (), 2)         AS pct_of_total_revenue
-FROM customer_totals
+    ROUND(revenue / orders, 2)                        AS avg_order_value,
+    ROUND(100.0 * revenue / SUM(revenue) OVER (), 2)  AS pct_of_total
+FROM totals
 ORDER BY revenue DESC
 LIMIT 10;
 
 
--- ------------------------------------------------------------
--- Q7. Running cumulative revenue by year — the growth trajectory.
--- Technique: SUM() OVER with an ordered frame
--- ------------------------------------------------------------
+-- Q6. Cumulative revenue by year — the growth trajectory.
+-- Technique: SUM() OVER with an explicit window frame
 WITH yearly AS (
-    SELECT
-        STRFTIME('%Y', order_date) AS year,
-        SUM(sales)                 AS revenue
-    FROM orders
+    SELECT STRFTIME('%Y', o.order_date) AS year,
+           SUM(i.sales)                 AS revenue
+    FROM order_items i
+    JOIN orders o ON i.order_id = o.order_id
     GROUP BY year
 )
 SELECT
     year,
-    ROUND(revenue, 2)                                          AS revenue,
+    ROUND(revenue, 2) AS revenue,
     ROUND(SUM(revenue) OVER (ORDER BY year
-          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 2) AS cumulative_revenue
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 2) AS cumulative
 FROM yearly
 ORDER BY year;
 
 
--- ------------------------------------------------------------
--- Q8. Which regional managers oversee loss-making sub-categories?
--- Technique: three-table join, HAVING on an aggregate
--- ------------------------------------------------------------
+-- Q7. Do customers come back? Repeat rate by segment.
+-- Technique: nested aggregation — count orders per customer, then bucket
+WITH per_customer AS (
+    SELECT c.customer_id, c.segment, COUNT(DISTINCT o.order_id) AS orders
+    FROM customers c
+    JOIN orders o ON c.customer_id = o.customer_id
+    GROUP BY c.customer_id, c.segment
+)
 SELECT
-    m.manager,
-    o.region,
-    o.sub_category,
-    ROUND(SUM(o.sales), 2)  AS revenue,
-    ROUND(SUM(o.profit), 2) AS profit
-FROM orders o
-JOIN managers m ON o.region = m.region
-GROUP BY m.manager, o.region, o.sub_category
-HAVING SUM(o.profit) < 0
-ORDER BY profit ASC;
+    segment,
+    COUNT(*)                                                  AS customers,
+    SUM(CASE WHEN orders = 1 THEN 1 ELSE 0 END)               AS one_time,
+    SUM(CASE WHEN orders > 1 THEN 1 ELSE 0 END)               AS repeat_customers,
+    ROUND(100.0 * SUM(CASE WHEN orders > 1 THEN 1 ELSE 0 END)
+          / COUNT(*), 1)                                      AS repeat_pct,
+    ROUND(AVG(orders), 2)                                     AS avg_orders
+FROM per_customer
+GROUP BY segment
+ORDER BY repeat_pct DESC;
+
+
+-- Q8. Shipping speed: how long between order and dispatch?
+-- Technique: date arithmetic (JULIANDAY), grouping on two dimensions
+SELECT
+    ship_mode,
+    region,
+    COUNT(*)                                                   AS orders,
+    ROUND(AVG(JULIANDAY(ship_date) - JULIANDAY(order_date)), 2) AS avg_days,
+    MAX(CAST(JULIANDAY(ship_date) - JULIANDAY(order_date) AS INT)) AS max_days
+FROM orders
+WHERE ship_date IS NOT NULL
+GROUP BY ship_mode, region
+ORDER BY ship_mode, avg_days DESC;
