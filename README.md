@@ -10,7 +10,7 @@ returns, discounting, and regional performance.
 ## Setup
 
 ```bash
-git clone https://github.com/⟨handle⟩/superstore-sql-analysis
+git clone https://github.com/idrisrazaballry/superstore-sql-analysis
 cd superstore-sql-analysis
 python load.py            # builds superstore.db from data/*.csv
 sqlite3 superstore.db < queries/analysis.sql
